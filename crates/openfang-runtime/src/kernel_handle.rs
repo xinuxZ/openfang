@@ -135,6 +135,18 @@ pub trait KernelHandle: Send + Sync {
         Ok(true) // Default: auto-approve
     }
 
+    /// Check if a base command (e.g. "curl", "git") has been runtime-approved
+    /// by the user during this session. Used for shell_exec fast-path: if the
+    /// user already approved a command once, skip the approval dialog.
+    fn is_cmd_approved(&self, _agent_id: &str, _base_cmd: &str) -> bool {
+        false
+    }
+
+    /// Persist a runtime command approval to config.toml so it survives restarts.
+    fn persist_cmd_approval(&self, _base_cmd: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     /// List available Hands and their activation status.
     async fn hand_list(&self) -> Result<Vec<serde_json::Value>, String> {
         Err("Hands system not available".to_string())

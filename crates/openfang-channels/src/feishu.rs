@@ -333,6 +333,100 @@ impl FeishuAdapter {
         Ok(())
     }
 
+    /// Send an interactive card with approve/reject buttons.
+    async fn api_send_card(
+        &self,
+        receive_id: &str,
+        request_id: &str,
+        agent_id: &str,
+        tool_name: &str,
+        action_summary: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let token = self.get_token().await?;
+        let url = format!(
+            "{}?receive_id_type=chat_id",
+            self.api_url("/open-apis/im/v1/messages")
+        );
+
+        // Build interactive card JSON
+        let card = serde_json::json!({
+            "config": {
+                "wide_screen_mode": true
+            },
+            "header": {
+                "title": { "tag": "plain_text", "content": "⏳ 待审批请求" },
+                "template": "blue"
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "plain_text",
+                        "content": format!("Agent: {}\n操作: {} — {}", agent_id, tool_name, action_summary)
+                    }
+                },
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "plain_text",
+                        "content": format!("ID: `{}`", &request_id[..8.min(request_id.len())])
+                    }
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button",
+                            "text": { "tag": "plain_text", "content": "✅ 批准" },
+                            "type": "primary",
+                            "value": { "action": "approve", "request_id": request_id }
+                        },
+                        {
+                            "tag": "button",
+                            "text": { "tag": "plain_text", "content": "❌ 拒绝" },
+                            "type": "danger",
+                            "value": { "action": "reject", "request_id": request_id }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let body = serde_json::json!({
+            "receive_id": receive_id,
+            "msg_type": "interactive",
+            "content": card.to_string(),
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let resp_body = resp.text().await.unwrap_or_default();
+            warn!("{} card send error {status}: {resp_body}", self.region.label());
+            // Fall back to text message
+            return self.api_send_message(
+                receive_id,
+                "chat_id",
+                &format!("待审批请求 [{}]\nAgent: {}\n操作: {} — {}\n\n回复 /approve {} 或 /reject {}",
+                    &request_id[..8.min(request_id.len())],
+                    agent_id,
+                    tool_name,
+                    action_summary,
+                    &request_id[..8.min(request_id.len())],
+                    &request_id[..8.min(request_id.len())]
+                )
+            ).await;
+        }
+        Ok(())
+    }
+
     /// Reply to a message in a thread.
     #[allow(dead_code)]
     async fn api_reply_message(
@@ -491,7 +585,7 @@ fn decrypt_event(
 }
 
 /// Parse a webhook event (V2 schema) into a `ChannelMessage`.
-fn parse_event(
+fn parse_feishu_text_message_event(
     event: &serde_json::Value,
     bot_names: &[String],
     channel_name: &str,
@@ -609,6 +703,117 @@ fn parse_event(
         timestamp: Utc::now(),
         is_group,
         thread_id: root_id,
+        metadata,
+    })
+}
+
+/// Unified event parser: tries text message first, then card action.
+fn parse_event(
+    event: &serde_json::Value,
+    bot_names: &[String],
+    channel_name: &str,
+) -> Option<ChannelMessage> {
+    parse_feishu_text_message_event(event, bot_names, channel_name)
+        .or_else(|| parse_feishu_card_action_event(event))
+}
+
+/// Parse a Feishu interactive card button callback into a Command message.
+///
+/// Handles `card.action.trigger` (card button clicks) and `application.bot.menu_v6`
+/// (bot menu actions). Extracts the action ("approve"/"reject") and request_id from
+/// the button value payload.
+fn parse_feishu_card_action_event(event: &serde_json::Value) -> Option<ChannelMessage> {
+    let event_type = event
+        .get("header")
+        .and_then(|h| h.get("event_type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if event_type != "application.bot.menu_v6" && event_type != "card.action.trigger" {
+        return None;
+    }
+
+    let action_value = event.get("event")?.get("action")?.get("value")?;
+
+    let action = action_value.get("action")?.as_str()?;
+    if action != "approve" && action != "reject" {
+        return None;
+    }
+
+    let request_id = action_value.get("request_id")?.as_str()?;
+    if request_id.is_empty() {
+        return None;
+    }
+
+    let event_data = event.get("event")?;
+    let context = event_data.get("context");
+
+    let chat_id = event_data
+        .get("open_chat_id")
+        .or_else(|| context.and_then(|c| c.get("open_chat_id")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let message_id = event_data
+        .get("open_message_id")
+        .or_else(|| context.and_then(|c| c.get("open_message_id")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let operator_id = event_data
+        .get("operator")
+        .and_then(|v| {
+            v.get("open_id")
+                .or_else(|| v.get("operator_id").and_then(|oid| oid.get("open_id")))
+        })
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "event_source".to_string(),
+        serde_json::Value::String("feishu_card_action".to_string()),
+    );
+    if !message_id.is_empty() {
+        metadata.insert(
+            "open_message_id".to_string(),
+            serde_json::Value::String(message_id.clone()),
+        );
+    }
+    if !operator_id.is_empty() {
+        metadata.insert(
+            "sender_id".to_string(),
+            serde_json::Value::String(operator_id.clone()),
+        );
+    }
+    if !chat_id.is_empty() {
+        metadata.insert(
+            "chat_id".to_string(),
+            serde_json::Value::String(chat_id.clone()),
+        );
+    }
+
+    Some(ChannelMessage {
+        channel: ChannelType::Custom("feishu".to_string()),
+        platform_message_id: if message_id.is_empty() {
+            format!("card-action-{action}-{request_id}")
+        } else {
+            message_id
+        },
+        sender: ChannelUser {
+            platform_id: chat_id,
+            display_name: operator_id,
+            openfang_user: None,
+        },
+        content: ChannelContent::Command {
+            name: action.to_string(),
+            args: vec![request_id.to_string()],
+        },
+        target_agent: None,
+        timestamp: Utc::now(),
+        is_group: true,
+        thread_id: None,
         metadata,
     })
 }
@@ -867,6 +1072,21 @@ impl ChannelAdapter for FeishuAdapter {
             ChannelContent::Text(text) => {
                 self.api_send_message(&user.platform_id, "chat_id", &text)
                     .await?;
+            }
+            ChannelContent::ApprovalRequest {
+                request_id,
+                agent_id,
+                tool_name,
+                action_summary,
+            } => {
+                self.api_send_card(
+                    &user.platform_id,
+                    &request_id,
+                    &agent_id,
+                    &tool_name,
+                    &action_summary,
+                )
+                .await?;
             }
             _ => {
                 self.api_send_message(&user.platform_id, "chat_id", "(Unsupported content type)")

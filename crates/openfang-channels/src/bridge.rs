@@ -208,6 +208,17 @@ pub trait ChannelBridgeHandle: Send + Sync {
         "Approvals not available.".to_string()
     }
 
+    /// Subscribe to real-time approval request notifications.
+    ///
+    /// Returns a broadcast receiver that fires whenever a new approval request
+    /// is submitted. Channel adapters use this to push interactive cards/messages
+    /// to users so they can approve or reject without polling.
+    fn approval_pending_rx(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<openfang_types::approval::ApprovalRequest>> {
+        None
+    }
+
     // ── Budget, Network, A2A ──
 
     /// Show global budget status (limits, spend, % used).
@@ -317,10 +328,15 @@ impl BridgeManager {
         let adapter_clone = adapter.clone();
         let mut shutdown = self.shutdown_rx.clone();
 
+        // Watch channel to track the most recently active user (for approval notifications).
+        let (last_sender_tx, last_sender_rx) = watch::channel::<Option<ChannelUser>>(None);
+        let last_sender_tx = Arc::new(last_sender_tx);
+
         // Limit concurrent dispatch tasks to prevent unbounded growth.
         // 32 is generous — most setups have 1-5 concurrent users.
         let semaphore = Arc::new(tokio::sync::Semaphore::new(32));
 
+        let last_sender_tx_clone = last_sender_tx.clone();
         let task = tokio::spawn(async move {
             let mut stream = std::pin::pin!(stream);
             loop {
@@ -328,6 +344,9 @@ impl BridgeManager {
                     msg = stream.next() => {
                         match msg {
                             Some(message) => {
+                                // Track the most recently active sender for approval notifications.
+                                let _ = last_sender_tx_clone.send(Some(message.sender.clone()));
+
                                 // Spawn each dispatch as a concurrent task so the stream
                                 // loop is never blocked by slow LLM calls. The kernel's
                                 // per-agent lock ensures session integrity.
@@ -369,6 +388,56 @@ impl BridgeManager {
         });
 
         self.tasks.push(task);
+
+        // Spawn approval notification task: listens for new approval requests
+        // and forwards them as interactive cards to the most recently active user.
+        if let Some(mut approval_rx) = self.handle.approval_pending_rx() {
+            let adapter_for_approval = adapter.clone();
+            let mut shutdown_for_approval = self.shutdown_rx.clone();
+            let approval_task = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        result = approval_rx.recv() => {
+                            match result {
+                                Ok(req) => {
+                                    let sender = last_sender_rx.borrow().clone();
+                                    if let Some(user) = sender {
+                                        let adapter = adapter_for_approval.clone();
+                                        let content = ChannelContent::ApprovalRequest {
+                                            request_id: req.id.to_string(),
+                                            agent_id: req.agent_id.clone(),
+                                            tool_name: req.tool_name.clone(),
+                                            action_summary: req.action_summary.clone(),
+                                        };
+                                        // Spawn independently so we don't block the next notification
+                                        tokio::spawn(async move {
+                                            if let Err(e) = adapter.send(&user, content).await {
+                                                warn!("Failed to send approval card: {e}");
+                                            }
+                                        });
+                                    } else {
+                                        debug!("Approval notification skipped: no active sender yet");
+                                    }
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    warn!("Approval notification lagged, missed {n} events");
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    break;
+                                }
+                            }
+                        }
+                        _ = shutdown_for_approval.changed() => {
+                            if *shutdown_for_approval.borrow() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            self.tasks.push(approval_task);
+        }
+
         Ok(())
     }
 
@@ -680,6 +749,10 @@ async fn dispatch_message(
         }
         ChannelContent::FileData { ref filename, .. } => {
             format!("[User sent a local file: {filename}]")
+        }
+        ChannelContent::ApprovalRequest { .. } => {
+            // Approval requests are outbound-only; should not appear as inbound text.
+            return;
         }
     };
 

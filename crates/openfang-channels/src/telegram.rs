@@ -390,6 +390,23 @@ impl TelegramAdapter {
                 self.api_send_message(chat_id, text.trim(), thread_id)
                     .await?;
             }
+            ChannelContent::ApprovalRequest {
+                request_id,
+                agent_id,
+                tool_name,
+                action_summary,
+            } => {
+                let text = format!(
+                    "⏳ 待审批请求 [{}]\nAgent: {}\n操作: {} — {}\n\n回复 /approve {} 或 /reject {}",
+                    &request_id[..8.min(request_id.len())],
+                    agent_id,
+                    tool_name,
+                    action_summary,
+                    &request_id[..8.min(request_id.len())],
+                    &request_id[..8.min(request_id.len())]
+                );
+                self.api_send_message(chat_id, &text, thread_id).await?;
+            }
         }
         Ok(())
     }

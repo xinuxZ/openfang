@@ -137,35 +137,64 @@ pub async fn execute_tool(
     if let Some(kh) = kernel {
         if kh.requires_approval(tool_name) {
             let agent_id_str = caller_agent_id.unwrap_or("unknown");
-            let input_str = input.to_string();
-            let summary = format!(
-                "{}: {}",
-                tool_name,
-                openfang_types::truncate_str(&input_str, 200)
-            );
-            match kh.request_approval(agent_id_str, tool_name, &summary).await {
-                Ok(true) => {
-                    debug!(tool_name, "Approval granted — proceeding with execution");
+
+            // Fast-path: if this is shell_exec and the base command was already approved,
+            // skip the interactive approval dialog.
+            let skip_approval = if tool_name == "shell_exec" {
+                let command = input["command"].as_str().unwrap_or("");
+                let base_cmd = crate::subprocess_sandbox::extract_all_commands(command)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                !base_cmd.is_empty() && kh.is_cmd_approved(agent_id_str, base_cmd)
+            } else {
+                false
+            };
+
+            if !skip_approval {
+                let input_str = input.to_string();
+                let summary = format!(
+                    "{}: {}",
+                    tool_name,
+                    openfang_types::truncate_str(&input_str, 200)
+                );
+                match kh.request_approval(agent_id_str, tool_name, &summary).await {
+                    Ok(true) => {
+                        debug!(tool_name, "Approval granted — proceeding with execution");
+                        // Persist the base command approval for future fast-path
+                        if tool_name == "shell_exec" {
+                            let command = input["command"].as_str().unwrap_or("");
+                            let base_cmd = crate::subprocess_sandbox::extract_all_commands(command)
+                                .into_iter()
+                                .next()
+                                .unwrap_or_default();
+                            if !base_cmd.is_empty() {
+                                let _ = kh.persist_cmd_approval(base_cmd);
+                            }
+                        }
+                    }
+                    Ok(false) => {
+                        warn!(tool_name, "Approval denied — blocking tool execution");
+                        return ToolResult {
+                            tool_use_id: tool_use_id.to_string(),
+                            content: format!(
+                                "Execution denied: '{}' requires human approval and was denied or timed out. The operation was not performed.",
+                                tool_name
+                            ),
+                            is_error: true,
+                        };
+                    }
+                    Err(e) => {
+                        warn!(tool_name, error = %e, "Approval system error");
+                        return ToolResult {
+                            tool_use_id: tool_use_id.to_string(),
+                            content: format!("Approval system error: {e}"),
+                            is_error: true,
+                        };
+                    }
                 }
-                Ok(false) => {
-                    warn!(tool_name, "Approval denied — blocking tool execution");
-                    return ToolResult {
-                        tool_use_id: tool_use_id.to_string(),
-                        content: format!(
-                            "Execution denied: '{}' requires human approval and was denied or timed out. The operation was not performed.",
-                            tool_name
-                        ),
-                        is_error: true,
-                    };
-                }
-                Err(e) => {
-                    warn!(tool_name, error = %e, "Approval system error");
-                    return ToolResult {
-                        tool_use_id: tool_use_id.to_string(),
-                        content: format!("Approval system error: {e}"),
-                        is_error: true,
-                    };
-                }
+            } else {
+                debug!(tool_name, "Approval fast-path: command already approved");
             }
         }
     }

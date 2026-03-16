@@ -680,6 +680,12 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         }
     }
 
+    fn approval_pending_rx(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<openfang_types::approval::ApprovalRequest>> {
+        Some(self.kernel.approval_manager.subscribe())
+    }
+
     async fn reset_session(&self, agent_id: AgentId) -> Result<String, String> {
         self.kernel
             .reset_session(agent_id)
