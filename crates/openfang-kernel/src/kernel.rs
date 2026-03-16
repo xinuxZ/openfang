@@ -6080,6 +6080,74 @@ impl KernelHandle for OpenFangKernel {
         Ok(decision == ApprovalDecision::Approved)
     }
 
+    fn is_cmd_approved(&self, _agent_id: &str, base_cmd: &str) -> bool {
+        // Check static allowlist from config
+        if self
+            .config
+            .exec_policy
+            .allowed_commands
+            .iter()
+            .any(|c| c == base_cmd)
+        {
+            return true;
+        }
+        // Check runtime-approved set (approved this session, pending restart pickup)
+        self.approval_manager
+            .runtime_allowed_cmds
+            .contains(base_cmd)
+    }
+
+    fn persist_cmd_approval(&self, base_cmd: &str) -> Result<(), String> {
+        // Skip if already approved (static or runtime)
+        if self.is_cmd_approved("", base_cmd) {
+            return Ok(());
+        }
+
+        // Add to runtime set so the current session doesn't ask again
+        self.approval_manager
+            .runtime_allowed_cmds
+            .insert(base_cmd.to_string());
+
+        // Write the updated allowlist to config.toml so future restarts pick it up.
+        let config_path = self.config.home_dir.join("config.toml");
+        let raw = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("Failed to read config.toml: {e}"))?;
+
+        let mut doc = raw
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| format!("Failed to parse config.toml: {e}"))?;
+
+        // Ensure [exec_policy] table exists
+        if !doc.contains_key("exec_policy") {
+            doc["exec_policy"] = toml_edit::table();
+        }
+        let ep = doc["exec_policy"]
+            .as_table_mut()
+            .ok_or("exec_policy is not a table")?;
+
+        // Ensure allowed_commands array exists
+        if !ep.contains_key("allowed_commands") {
+            ep["allowed_commands"] = toml_edit::value(toml_edit::Array::new());
+        }
+        let arr = ep["allowed_commands"]
+            .as_array_mut()
+            .ok_or("allowed_commands is not an array")?;
+
+        // Add if not already present
+        let already = arr
+            .iter()
+            .any(|v: &toml_edit::Value| v.as_str() == Some(base_cmd));
+        if !already {
+            arr.push(base_cmd);
+        }
+
+        std::fs::write(&config_path, doc.to_string())
+            .map_err(|e| format!("Failed to write config.toml: {e}"))?;
+
+        info!(base_cmd, "Persisted exec_policy.allowed_commands entry to config.toml");
+        Ok(())
+    }
+
     fn list_a2a_agents(&self) -> Vec<(String, String)> {
         let agents = self
             .a2a_external_agents
