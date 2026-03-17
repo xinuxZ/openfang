@@ -798,9 +798,7 @@ mod tests {
         let config = DriverConfig {
             provider: "azure".to_string(),
             api_key: Some("test-azure-key".to_string()),
-            base_url: Some(
-                "https://myresource.openai.azure.com/openai/deployments".to_string(),
-            ),
+            base_url: Some("https://myresource.openai.azure.com/openai/deployments".to_string()),
             skip_permissions: true,
         };
         let driver = create_driver(&config);
@@ -812,9 +810,7 @@ mod tests {
         let config = DriverConfig {
             provider: "azure".to_string(),
             api_key: None,
-            base_url: Some(
-                "https://myresource.openai.azure.com/openai/deployments".to_string(),
-            ),
+            base_url: Some("https://myresource.openai.azure.com/openai/deployments".to_string()),
             skip_permissions: true,
         };
         let result = create_driver(&config);
@@ -850,9 +846,7 @@ mod tests {
         let config = DriverConfig {
             provider: "azure-openai".to_string(),
             api_key: Some("test-azure-key".to_string()),
-            base_url: Some(
-                "https://myresource.openai.azure.com/openai/deployments".to_string(),
-            ),
+            base_url: Some("https://myresource.openai.azure.com/openai/deployments".to_string()),
             skip_permissions: true,
         };
         let driver = create_driver(&config);
