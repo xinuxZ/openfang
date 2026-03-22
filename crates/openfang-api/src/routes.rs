@@ -16,7 +16,7 @@ use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Shared application state.
 ///
@@ -1892,6 +1892,22 @@ const CHANNEL_REGISTRY: &[ChannelMeta] = &[
         config_template: "[channels.feishu]\napp_id = \"\"\napp_secret_env = \"FEISHU_APP_SECRET\"\nregion = \"cn\"",
     },
     ChannelMeta {
+        name: "wechat", display_name: "WeChat", icon: "WX",
+        description: "WeChat iLink bot adapter with QR-code login",
+        category: "messaging", difficulty: "Easy", setup_time: "~1 min",
+        quick_setup: "Save your default agent, then scan the QR code with WeChat",
+        setup_type: "qr",
+        fields: &[
+            ChannelField { key: "default_agent", label: "Default Agent", field_type: FieldType::Text, env_var: None, required: false, placeholder: "assistant", advanced: false },
+            ChannelField { key: "allowed_users", label: "Allowed User IDs", field_type: FieldType::List, env_var: None, required: false, placeholder: "wxid_xxx, wxid_yyy", advanced: true },
+            ChannelField { key: "state_dir", label: "State Directory", field_type: FieldType::Text, env_var: None, required: false, placeholder: "~/.openfang/wechat", advanced: true },
+            ChannelField { key: "api_base_url", label: "API Base URL", field_type: FieldType::Text, env_var: None, required: false, placeholder: "https://ilinkai.weixin.qq.com", advanced: true },
+            ChannelField { key: "cdn_base_url", label: "CDN Base URL", field_type: FieldType::Text, env_var: None, required: false, placeholder: "https://novac2c.cdn.weixin.qq.com/c2c", advanced: true },
+        ],
+        setup_steps: &["Save the WeChat channel settings", "Open WeChat on your phone and scan the QR code", "Confirm the login on your phone to finish linking"],
+        config_template: "[channels.wechat]\nbot_token_env = \"WECHAT_BOT_TOKEN\"\naccount_id_env = \"WECHAT_ACCOUNT_ID\"\nuser_id_env = \"WECHAT_USER_ID\"",
+    },
+    ChannelMeta {
         name: "dingtalk", display_name: "DingTalk", icon: "DT",
         description: "DingTalk Robot API adapter",
         category: "enterprise", difficulty: "Easy", setup_time: "~3 min",
@@ -2220,6 +2236,7 @@ fn is_channel_configured(config: &openfang_types::config::ChannelsConfig, name: 
         "reddit" => config.reddit.is_some(),
         "mastodon" => config.mastodon.is_some(),
         "bluesky" => config.bluesky.is_some(),
+        "wechat" => config.wechat.is_some(),
         "linkedin" => config.linkedin.is_some(),
         "nostr" => config.nostr.is_some(),
         "teams" => config.teams.is_some(),
@@ -2404,6 +2421,10 @@ fn channel_config_values(
             .feishu
             .as_ref()
             .and_then(|c| serde_json::to_value(c).ok()),
+        "wechat" => config
+            .wechat
+            .as_ref()
+            .and_then(|c| serde_json::to_value(c).ok()),
         "revolt" => config
             .revolt
             .as_ref()
@@ -2488,6 +2509,61 @@ fn channel_config_values(
     }
 }
 
+fn wechat_state_dir(config: &openfang_types::config::WeChatConfig) -> std::path::PathBuf {
+    config
+        .state_dir
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| openfang_kernel::config::openfang_home().join("wechat"))
+}
+
+fn wechat_has_saved_credentials(config: &openfang_types::config::WeChatConfig) -> bool {
+    if std::env::var(&config.bot_token_env)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    let account_path = wechat_state_dir(config).join("account.json");
+    if !account_path.exists() {
+        return false;
+    }
+
+    std::fs::read_to_string(account_path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .and_then(|json| {
+            json.get("token")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .map(|token| !token.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn channel_has_token(
+    config: &openfang_types::config::ChannelsConfig,
+    meta: &ChannelMeta,
+) -> bool {
+    if meta.name == "wechat" {
+        return config
+            .wechat
+            .as_ref()
+            .map(wechat_has_saved_credentials)
+            .unwrap_or(false);
+    }
+
+    meta.fields
+        .iter()
+        .filter(|f| f.required && f.env_var.is_some())
+        .all(|f| {
+            f.env_var
+                .map(|ev| std::env::var(ev).map(|v| !v.is_empty()).unwrap_or(false))
+                .unwrap_or(true)
+        })
+}
+
 /// GET /api/channels — List all 40 channel adapters with status and field metadata.
 pub async fn list_channels(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Read the live channels config (updated on every hot-reload) instead of the
@@ -2502,16 +2578,13 @@ pub async fn list_channels(State(state): State<Arc<AppState>>) -> impl IntoRespo
             configured_count += 1;
         }
 
-        // Check if all required secret env vars are set
-        let has_token = meta
-            .fields
-            .iter()
-            .filter(|f| f.required && f.env_var.is_some())
-            .all(|f| {
-                f.env_var
-                    .map(|ev| std::env::var(ev).map(|v| !v.is_empty()).unwrap_or(false))
-                    .unwrap_or(true)
-            });
+        let has_token = channel_has_token(&live_channels, meta);
+        let connected = state
+            .kernel
+            .channel_adapters
+            .get(meta.name)
+            .map(|adapter| adapter.status().connected)
+            .unwrap_or(false);
 
         let config_vals = channel_config_values(&live_channels, meta.name);
         let fields: Vec<serde_json::Value> = meta
@@ -2532,6 +2605,7 @@ pub async fn list_channels(State(state): State<Arc<AppState>>) -> impl IntoRespo
             "setup_type": meta.setup_type,
             "configured": configured,
             "has_token": has_token,
+            "connected": connected,
             "fields": fields,
             "setup_steps": meta.setup_steps,
             "config_template": meta.config_template,
@@ -2620,6 +2694,29 @@ pub async fn configure_channel(
         );
     }
 
+    let fresh_config = openfang_kernel::config::load_config(Some(&config_path));
+    *state.channels_config.write().await = fresh_config.channels.clone();
+
+    if name == "wechat"
+        && fresh_config
+            .channels
+            .wechat
+            .as_ref()
+            .map(|cfg| !wechat_has_saved_credentials(cfg))
+            .unwrap_or(true)
+    {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "configured",
+                "channel": name,
+                "activated": false,
+                "requires_qr": true,
+                "note": "WeChat configuration saved. Scan the QR code to complete login."
+            })),
+        );
+    }
+
     // Hot-reload: activate the channel immediately
     match crate::channel_bridge::reload_channels_from_disk(&state).await {
         Ok(started) => {
@@ -2669,7 +2766,7 @@ pub async fn remove_channel(
         }
     };
 
-    let home = openfang_kernel::config::openfang_home();
+    let home = state.kernel.config.home_dir.clone();
     let secrets_path = home.join("secrets.env");
     let config_path = home.join("config.toml");
 
@@ -2681,6 +2778,30 @@ pub async fn remove_channel(
             unsafe {
                 std::env::remove_var(env_var);
             }
+        }
+    }
+
+    if name == "wechat" {
+        let wechat_config = {
+            let channels = state.channels_config.read().await;
+            channels.wechat.clone()
+        };
+
+        if let Some(config) = wechat_config {
+            for env_var in [
+                config.bot_token_env.as_str(),
+                config.account_id_env.as_str(),
+                config.user_id_env.as_str(),
+            ] {
+                let _ = remove_secret_env(&secrets_path, env_var);
+                // SAFETY: Single-threaded config operation
+                unsafe {
+                    std::env::remove_var(env_var);
+                }
+            }
+
+            let account_path = wechat_state_dir(&config).join("account.json");
+            let _ = std::fs::remove_file(account_path);
         }
     }
 
@@ -2864,6 +2985,18 @@ async fn send_channel_test_message(channel_name: &str, target_id: &str) -> Resul
     Ok(())
 }
 
+struct WeChatQrFlowState {
+    qrcode: String,
+    api_base_url: String,
+    state_dir: std::path::PathBuf,
+    bot_token_env: String,
+    account_id_env: String,
+    user_id_env: String,
+    expires_at: Instant,
+}
+
+static WECHAT_QR_FLOWS: LazyLock<DashMap<String, WeChatQrFlowState>> = LazyLock::new(DashMap::new);
+
 /// POST /api/channels/reload — Manually trigger a channel hot-reload from disk config.
 pub async fn reload_channels(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match crate::channel_bridge::reload_channels_from_disk(&state).await {
@@ -2887,6 +3020,353 @@ pub async fn reload_channels(State(state): State<Arc<AppState>>) -> impl IntoRes
 // ---------------------------------------------------------------------------
 // WhatsApp QR login flow (OpenClaw-style)
 // ---------------------------------------------------------------------------
+
+fn persist_wechat_account_state(
+    state_dir: &std::path::Path,
+    token: &str,
+    account_id: &str,
+    user_id: Option<&str>,
+) -> Result<(), String> {
+    std::fs::create_dir_all(state_dir).map_err(|e| e.to_string())?;
+    let payload = serde_json::json!({
+        "token": token,
+        "account_id": account_id,
+        "user_id": user_id,
+        "saved_at": chrono::Utc::now().to_rfc3339(),
+    });
+    std::fs::write(
+        state_dir.join("account.json"),
+        serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// POST /api/channels/wechat/qr/start — Start a WeChat QR login session.
+pub async fn wechat_qr_start(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    WECHAT_QR_FLOWS.retain(|_, flow| flow.expires_at > Instant::now());
+
+    let config = {
+        let channels = state.channels_config.read().await;
+        channels.wechat.clone()
+    };
+
+    let Some(config) = config else {
+        return Json(serde_json::json!({
+            "available": false,
+            "message": "WeChat is not configured yet. Save the channel settings first.",
+            "help": "Create a [channels.wechat] section in config.toml or save the WeChat form in the dashboard before starting QR login."
+        }));
+    };
+
+    if wechat_has_saved_credentials(&config) {
+        return Json(serde_json::json!({
+            "available": true,
+            "connected": true,
+            "message": "WeChat credentials already exist. Reload the channel if needed."
+        }));
+    }
+
+    let api_base_url = config
+        .api_base_url
+        .clone()
+        .unwrap_or_else(|| "https://ilinkai.weixin.qq.com".to_string());
+    let url = format!(
+        "{}/ilink/bot/get_bot_qrcode?bot_type=3",
+        api_base_url.trim_end_matches('/')
+    );
+
+    let client = reqwest::Client::new();
+    let response = match client
+        .get(url)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "available": false,
+                "message": format!("Could not reach WeChat QR endpoint: {e}"),
+            }))
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Json(serde_json::json!({
+            "available": false,
+            "message": format!("WeChat QR request failed {status}: {body}"),
+        }));
+    }
+
+    let body: serde_json::Value = match response.json().await {
+        Ok(json) => json,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "available": false,
+                "message": format!("Invalid WeChat QR response: {e}"),
+            }))
+        }
+    };
+
+    let qrcode = body
+        .get("qrcode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let qr_image_url = body
+        .get("qrcode_img_content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    if qrcode.is_empty() {
+        return Json(serde_json::json!({
+            "available": false,
+            "message": "WeChat QR response did not include a qrcode value."
+        }));
+    }
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    WECHAT_QR_FLOWS.insert(
+        session_id.clone(),
+        WeChatQrFlowState {
+            qrcode,
+            api_base_url,
+            state_dir: wechat_state_dir(&config),
+            bot_token_env: config.bot_token_env,
+            account_id_env: config.account_id_env,
+            user_id_env: config.user_id_env,
+            expires_at: Instant::now() + Duration::from_secs(8 * 60),
+        },
+    );
+
+    Json(serde_json::json!({
+        "available": true,
+        "qr_data_url": qr_image_url,
+        "session_id": session_id,
+        "message": "Scan this QR code with WeChat, then confirm login on your phone.",
+        "connected": false
+    }))
+}
+
+/// GET /api/channels/wechat/qr/status — Poll for WeChat QR scan completion.
+pub async fn wechat_qr_status(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    WECHAT_QR_FLOWS.retain(|_, flow| flow.expires_at > Instant::now());
+
+    let session_id = params.get("session_id").cloned().unwrap_or_default();
+    let Some(flow) = WECHAT_QR_FLOWS.get(&session_id) else {
+        return Json(serde_json::json!({
+            "connected": false,
+            "expired": true,
+            "message": "QR login session not found or already expired."
+        }));
+    };
+
+    if flow.expires_at <= Instant::now() {
+        drop(flow);
+        WECHAT_QR_FLOWS.remove(&session_id);
+        return Json(serde_json::json!({
+            "connected": false,
+            "expired": true,
+            "message": "QR code expired. Generate a new one."
+        }));
+    }
+
+    let status_url = format!(
+        "{}/ilink/bot/get_qrcode_status",
+        flow.api_base_url.trim_end_matches('/')
+    );
+    let client = reqwest::Client::new();
+    let response = match client
+        .get(status_url)
+        .query(&[("qrcode", flow.qrcode.as_str())])
+        .timeout(Duration::from_secs(12))
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(err) => {
+            if err.is_timeout() {
+                return Json(serde_json::json!({
+                    "connected": false,
+                    "expired": false,
+                    "message": "Waiting for scan..."
+                }));
+            }
+            return Json(serde_json::json!({
+                "connected": false,
+                "expired": false,
+                "message": format!("WeChat status check failed: {err}")
+            }));
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Json(serde_json::json!({
+            "connected": false,
+            "expired": false,
+            "message": format!("WeChat status failed {status}: {body}")
+        }));
+    }
+
+    let payload: serde_json::Value = match response.json().await {
+        Ok(json) => json,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "connected": false,
+                "expired": false,
+                "message": format!("Invalid WeChat status response: {e}")
+            }))
+        }
+    };
+
+    let status = payload
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("wait");
+
+    match status {
+        "wait" => Json(serde_json::json!({
+            "connected": false,
+            "expired": false,
+            "message": "Waiting for scan..."
+        })),
+        "scaned" => Json(serde_json::json!({
+            "connected": false,
+            "expired": false,
+            "message": "QR scanned. Confirm the login in WeChat on your phone."
+        })),
+        "expired" => {
+            drop(flow);
+            WECHAT_QR_FLOWS.remove(&session_id);
+            Json(serde_json::json!({
+                "connected": false,
+                "expired": true,
+                "message": "QR code expired. Generate a new one."
+            }))
+        }
+        "confirmed" => {
+            let bot_token = match payload.get("bot_token").and_then(serde_json::Value::as_str) {
+                Some(value) if !value.is_empty() => value.to_string(),
+                _ => {
+                    return Json(serde_json::json!({
+                        "connected": false,
+                        "expired": false,
+                        "message": "WeChat login completed but bot_token was missing."
+                    }))
+                }
+            };
+            let account_id =
+                match payload.get("ilink_bot_id").and_then(serde_json::Value::as_str) {
+                    Some(value) if !value.is_empty() => value.to_string(),
+                    _ => {
+                        return Json(serde_json::json!({
+                            "connected": false,
+                            "expired": false,
+                            "message": "WeChat login completed but account_id was missing."
+                        }))
+                    }
+                };
+            let user_id = payload
+                .get("ilink_user_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+
+            if let Err(e) = write_secret_env(
+                &state.kernel.config.home_dir.join("secrets.env"),
+                &flow.bot_token_env,
+                &bot_token,
+            ) {
+                return Json(serde_json::json!({
+                    "connected": false,
+                    "expired": false,
+                    "message": format!("Failed to save WeChat bot token: {e}")
+                }));
+            }
+            let _ = write_secret_env(
+                &state.kernel.config.home_dir.join("secrets.env"),
+                &flow.account_id_env,
+                &account_id,
+            );
+            if let Some(ref user_id) = user_id {
+                let _ = write_secret_env(
+                    &state.kernel.config.home_dir.join("secrets.env"),
+                    &flow.user_id_env,
+                    user_id,
+                );
+            }
+
+            std::env::set_var(&flow.bot_token_env, &bot_token);
+            std::env::set_var(&flow.account_id_env, &account_id);
+            if let Some(ref user_id) = user_id {
+                std::env::set_var(&flow.user_id_env, user_id);
+            }
+
+            let _ = persist_wechat_account_state(
+                &flow.state_dir,
+                &bot_token,
+                &account_id,
+                user_id.as_deref(),
+            );
+
+            drop(flow);
+            WECHAT_QR_FLOWS.remove(&session_id);
+
+            let _ = crate::channel_bridge::reload_channels_from_disk(&state).await;
+
+            Json(serde_json::json!({
+                "connected": true,
+                "expired": false,
+                "message": "WeChat linked successfully."
+            }))
+        }
+        other => Json(serde_json::json!({
+            "connected": false,
+            "expired": false,
+            "message": format!("Unexpected WeChat QR status: {other}")
+        })),
+    }
+}
+
+/// POST /api/channels/{name}/qr/start — Start QR login for supported channels.
+pub async fn channel_qr_start(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match name.as_str() {
+        "whatsapp" => whatsapp_qr_start().await.into_response(),
+        "wechat" => wechat_qr_start(State(state)).await.into_response(),
+        _ => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "QR login not supported for this channel"})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/channels/{name}/qr/status — Poll QR login status for supported channels.
+pub async fn channel_qr_status(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    query: axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    match name.as_str() {
+        "whatsapp" => whatsapp_qr_status(query).await.into_response(),
+        "wechat" => wechat_qr_status(State(state), query).await.into_response(),
+        _ => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "QR status not supported for this channel"})),
+        )
+            .into_response(),
+    }
+}
 
 /// POST /api/channels/whatsapp/qr/start — Start a WhatsApp Web QR login session.
 ///

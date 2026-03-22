@@ -2465,9 +2465,15 @@ impl Default for WeComConfig {
 }
 
 /// WeChat iLink Bot channel adapter configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WeChatConfig {
+    /// Env var name holding the bot token obtained from QR login.
+    pub bot_token_env: String,
+    /// Env var name holding the WeChat account ID obtained from QR login.
+    pub account_id_env: String,
+    /// Env var name holding the WeChat user ID obtained from QR login.
+    pub user_id_env: String,
     /// WeChat user IDs allowed to interact (empty = allow all).
     #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub allowed_users: Vec<String>,
@@ -2482,6 +2488,22 @@ pub struct WeChatConfig {
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
+}
+
+impl Default for WeChatConfig {
+    fn default() -> Self {
+        Self {
+            bot_token_env: "WECHAT_BOT_TOKEN".to_string(),
+            account_id_env: "WECHAT_ACCOUNT_ID".to_string(),
+            user_id_env: "WECHAT_USER_ID".to_string(),
+            allowed_users: vec![],
+            default_agent: None,
+            api_base_url: None,
+            cdn_base_url: None,
+            state_dir: None,
+            overrides: ChannelOverrides::default(),
+        }
+    }
 }
 
 /// Revolt (Discord-like) channel adapter configuration.
@@ -3672,6 +3694,9 @@ mod tests {
     #[test]
     fn test_wechat_config_defaults() {
         let wc = WeChatConfig::default();
+        assert_eq!(wc.bot_token_env, "WECHAT_BOT_TOKEN");
+        assert_eq!(wc.account_id_env, "WECHAT_ACCOUNT_ID");
+        assert_eq!(wc.user_id_env, "WECHAT_USER_ID");
         assert!(wc.allowed_users.is_empty());
         assert!(wc.default_agent.is_none());
         assert!(wc.api_base_url.is_none());

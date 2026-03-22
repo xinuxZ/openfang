@@ -1451,6 +1451,9 @@ pub async fn start_channel_bridge_with_config(
     // WeChat iLink
     if let Some(ref wc_config) = config.wechat {
         let adapter = Arc::new(WeChatAdapter::new(
+            wc_config.bot_token_env.clone(),
+            wc_config.account_id_env.clone(),
+            wc_config.user_id_env.clone(),
             wc_config.allowed_users.clone(),
             wc_config.api_base_url.clone(),
             wc_config.cdn_base_url.clone(),

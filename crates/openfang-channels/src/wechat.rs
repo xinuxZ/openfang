@@ -58,6 +58,9 @@ struct AdapterRuntimeState {
 
 /// WeChat iLink adapter with QR login and long polling.
 pub struct WeChatAdapter {
+    bot_token_env: String,
+    account_id_env: String,
+    user_id_env: String,
     api_base_url: String,
     _cdn_base_url: String,
     state_dir: PathBuf,
@@ -74,6 +77,9 @@ pub struct WeChatAdapter {
 
 impl WeChatAdapter {
     pub fn new(
+        bot_token_env: String,
+        account_id_env: String,
+        user_id_env: String,
         allowed_users: Vec<String>,
         api_base_url: Option<String>,
         cdn_base_url: Option<String>,
@@ -81,6 +87,9 @@ impl WeChatAdapter {
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let adapter = Self {
+            bot_token_env,
+            account_id_env,
+            user_id_env,
             api_base_url: api_base_url.unwrap_or_else(|| DEFAULT_API_BASE_URL.to_string()),
             _cdn_base_url: cdn_base_url.unwrap_or_else(|| DEFAULT_CDN_BASE_URL.to_string()),
             state_dir: state_dir
@@ -102,6 +111,9 @@ impl WeChatAdapter {
 
     fn clone_for_task(&self) -> Self {
         Self {
+            bot_token_env: self.bot_token_env.clone(),
+            account_id_env: self.account_id_env.clone(),
+            user_id_env: self.user_id_env.clone(),
             api_base_url: self.api_base_url.clone(),
             _cdn_base_url: self._cdn_base_url.clone(),
             state_dir: self.state_dir.clone(),
@@ -118,17 +130,38 @@ impl WeChatAdapter {
     }
 
     fn load_persisted_state(&self) {
+        if let Ok(token) = std::env::var(&self.bot_token_env).map(|value| value.trim().to_string()) {
+            if !token.is_empty() {
+                if let Ok(mut guard) = self.bot_token.write() {
+                    *guard = Some(token);
+                }
+            }
+        }
+        if let Ok(account_id) =
+            std::env::var(&self.account_id_env).map(|value| value.trim().to_string())
+        {
+            if !account_id.is_empty() {
+                if let Ok(mut guard) = self.account_id.write() {
+                    *guard = Some(account_id);
+                }
+            }
+        }
+
         let account_path = self.state_dir.join("account.json");
         if let Ok(content) = std::fs::read_to_string(&account_path) {
             if let Ok(account) = serde_json::from_str::<AccountData>(&content) {
-                if let Some(token) = account.token.filter(|value| !value.is_empty()) {
-                    if let Ok(mut guard) = self.bot_token.write() {
-                        *guard = Some(token);
+                if self.get_token().is_none() {
+                    if let Some(token) = account.token.filter(|value| !value.is_empty()) {
+                        if let Ok(mut guard) = self.bot_token.write() {
+                            *guard = Some(token);
+                        }
                     }
                 }
-                if let Some(account_id) = account.account_id {
-                    if let Ok(mut guard) = self.account_id.write() {
-                        *guard = Some(account_id);
+                if self.account_id.read().ok().and_then(|guard| guard.clone()).is_none() {
+                    if let Some(account_id) = account.account_id {
+                        if let Ok(mut account_guard) = self.account_id.write() {
+                            *account_guard = Some(account_id);
+                        }
                     }
                 }
             }
@@ -157,6 +190,18 @@ impl WeChatAdapter {
         if let Ok(serialized) = serde_json::to_string_pretty(&data) {
             let _ = std::fs::write(self.state_dir.join("account.json"), serialized);
         }
+    }
+
+    pub fn bot_token_env(&self) -> &str {
+        &self.bot_token_env
+    }
+
+    pub fn account_id_env(&self) -> &str {
+        &self.account_id_env
+    }
+
+    pub fn user_id_env(&self) -> &str {
+        &self.user_id_env
     }
 
     fn save_cursor(&self, cursor: &str) {
@@ -747,7 +792,15 @@ mod tests {
 
     #[test]
     fn wechat_defaults_to_custom_channel_type() {
-        let adapter = WeChatAdapter::new(vec![], None, None, None);
+        let adapter = WeChatAdapter::new(
+            "WECHAT_BOT_TOKEN".to_string(),
+            "WECHAT_ACCOUNT_ID".to_string(),
+            "WECHAT_USER_ID".to_string(),
+            vec![],
+            None,
+            None,
+            None,
+        );
         assert_eq!(
             adapter.channel_type(),
             ChannelType::Custom("wechat".to_string())

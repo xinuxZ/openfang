@@ -85,13 +85,59 @@ function channelsPage() {
       return this.setupModal && this.setupModal.setup_type === 'qr';
     },
 
+    isWhatsAppChannel() {
+      return this.setupModal && this.setupModal.name === 'whatsapp';
+    },
+
+    isConfiguredQrChannel() {
+      return this.isQrChannel() && this.setupModal && this.setupModal.configured;
+    },
+
+    needsQrLink() {
+      return this.isQrChannel() &&
+             !this.isWhatsAppChannel() &&
+             this.setupModal &&
+             this.setupModal.configured &&
+             !this.setupModal.has_token;
+    },
+
+    showQrPanel() {
+      if (!this.isQrChannel()) return false;
+      if (this.isWhatsAppChannel()) return !this.showBusinessApi;
+      return this.qr.connected || this.needsQrLink();
+    },
+
+    showConfigForm() {
+      if (!this.isQrChannel()) return true;
+      if (this.isWhatsAppChannel()) return this.showBusinessApi;
+      if (!this.setupModal) return false;
+      return !this.setupModal.configured || (this.setupModal.has_token && !this.qr.connected);
+    },
+
+    qrDisplayName() {
+      return this.setupModal ? this.setupModal.display_name : 'QR channel';
+    },
+
+    qrLoadingText() {
+      return 'Requesting a ' + this.qrDisplayName() + ' QR code...';
+    },
+
+    qrConnectedText() {
+      return this.qrDisplayName() + ' linked successfully!';
+    },
+
+    qrUnavailableText() {
+      if (this.isWhatsAppChannel()) return 'WhatsApp Web gateway not available';
+      return this.qrDisplayName() + ' QR login not available yet';
+    },
+
     async loadChannels() {
       this.loading = true;
       this.loadError = '';
       try {
         var data = await OpenFangAPI.get('/api/channels');
         this.allChannels = (data.channels || []).map(function(ch) {
-          ch.connected = ch.configured && ch.has_token;
+          ch.connected = !!ch.connected;
           return ch;
         });
       } catch(e) {
@@ -119,7 +165,7 @@ function channelsPage() {
           if (fresh) {
             c.configured = fresh.configured;
             c.has_token = fresh.has_token;
-            c.connected = fresh.configured && fresh.has_token;
+            c.connected = !!fresh.connected;
             c.fields = fresh.fields;
           }
         });
@@ -128,6 +174,7 @@ function channelsPage() {
 
     statusBadge(ch) {
       if (!ch.configured) return { text: 'Not Configured', cls: 'badge-muted' };
+      if (ch.name === 'wechat' && !ch.has_token) return { text: 'Needs Scan', cls: 'badge-warn' };
       if (!ch.has_token) return { text: 'Missing Token', cls: 'badge-warn' };
       if (ch.connected) return { text: 'Ready', cls: 'badge-success' };
       return { text: 'Configured', cls: 'badge-info' };
@@ -153,11 +200,11 @@ function channelsPage() {
       this.formValues = vals;
       this.showAdvanced = false;
       this.showBusinessApi = false;
-      this.setupStep = ch.configured ? 3 : 1;
-      this.testPassed = !!ch.configured;
+      this.setupStep = ch.configured ? (ch.has_token ? 3 : 2) : 1;
+      this.testPassed = !!(ch.configured && ch.has_token);
       this.resetQR();
       // Auto-start QR flow for QR-type channels
-      if (ch.setup_type === 'qr') {
+      if (ch.setup_type === 'qr' && (ch.name === 'whatsapp' || (ch.configured && !ch.has_token))) {
         this.startQR();
       }
     },
@@ -173,12 +220,13 @@ function channelsPage() {
     },
 
     async startQR() {
+      if (!this.setupModal) return;
       this.qr.loading = true;
       this.qr.error = '';
       this.qr.connected = false;
       this.qr.expired = false;
       try {
-        var result = await OpenFangAPI.post('/api/channels/whatsapp/qr/start', {});
+        var result = await OpenFangAPI.post('/api/channels/' + this.setupModal.name + '/qr/start', {});
         this.qr.available = result.available || false;
         this.qr.dataUrl = result.qr_data_url || '';
         this.qr.sessionId = result.session_id || '';
@@ -189,7 +237,7 @@ function channelsPage() {
           this.pollQR();
         }
         if (this.qr.connected) {
-          OpenFangToast.success('WhatsApp connected!');
+          OpenFangToast.success(this.qrDisplayName() + ' connected!');
           await this.refreshStatus();
         }
       } catch(e) {
@@ -203,13 +251,13 @@ function channelsPage() {
       if (this.qrPollTimer) clearInterval(this.qrPollTimer);
       this.qrPollTimer = setInterval(async function() {
         try {
-          var result = await OpenFangAPI.get('/api/channels/whatsapp/qr/status?session_id=' + encodeURIComponent(self.qr.sessionId));
+          var result = await OpenFangAPI.get('/api/channels/' + self.setupModal.name + '/qr/status?session_id=' + encodeURIComponent(self.qr.sessionId));
           if (result.connected) {
             clearInterval(self.qrPollTimer);
             self.qrPollTimer = null;
             self.qr.connected = true;
             self.qr.message = result.message || 'Connected!';
-            OpenFangToast.success('WhatsApp linked successfully!');
+            OpenFangToast.success(self.qrDisplayName() + ' linked successfully!');
             await self.refreshStatus();
           } else if (result.expired) {
             clearInterval(self.qrPollTimer);
@@ -230,9 +278,27 @@ function channelsPage() {
       var name = this.setupModal.name;
       this.configuring = true;
       try {
-        await OpenFangAPI.post('/api/channels/' + name + '/configure', {
+        var configureResult = await OpenFangAPI.post('/api/channels/' + name + '/configure', {
           fields: this.formValues
         });
+        await this.refreshStatus();
+        if (this.setupModal.setup_type === 'qr' && name !== 'whatsapp' && configureResult.requires_qr) {
+          this.setupModal.configured = true;
+          this.setupModal.has_token = false;
+          this.setupStep = 2;
+          this.testPassed = false;
+          OpenFangToast.success(configureResult.note || (this.setupModal.display_name + ' saved. Scan the QR code to finish linking.'));
+          await this.startQR();
+          this.configuring = false;
+          return;
+        }
+        if (this.setupModal.setup_type === 'qr' && name !== 'whatsapp') {
+          this.setupStep = 3;
+          this.testPassed = true;
+          OpenFangToast.success(configureResult.note || (this.setupModal.display_name + ' saved and activated.'));
+          this.configuring = false;
+          return;
+        }
         this.setupStep = 2;
         // Auto-test after save
         try {

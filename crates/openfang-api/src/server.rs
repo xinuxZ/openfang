@@ -258,14 +258,14 @@ pub async fn build_router(
             "/api/channels/reload",
             axum::routing::post(routes::reload_channels),
         )
-        // WhatsApp QR login flow
+        // QR login flow (WhatsApp / WeChat)
         .route(
-            "/api/channels/whatsapp/qr/start",
-            axum::routing::post(routes::whatsapp_qr_start),
+            "/api/channels/{name}/qr/start",
+            axum::routing::post(routes::channel_qr_start),
         )
         .route(
-            "/api/channels/whatsapp/qr/status",
-            axum::routing::get(routes::whatsapp_qr_status),
+            "/api/channels/{name}/qr/status",
+            axum::routing::get(routes::channel_qr_status),
         )
         // Template endpoints
         .route("/api/templates", axum::routing::get(routes::list_templates))
