@@ -50,6 +50,7 @@ pub async fn build_router(
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+        budget_config: Arc::new(tokio::sync::RwLock::new(kernel.config.budget.clone())),
     });
     let secret_snapshot = state.secrets_state.read().await.clone();
     let bridge = channel_bridge::start_channel_bridge_with_config(
