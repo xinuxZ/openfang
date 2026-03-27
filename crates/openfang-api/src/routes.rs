@@ -32,7 +32,7 @@ pub struct AppState {
     pub bridge_manager: tokio::sync::Mutex<Option<openfang_channels::bridge::BridgeManager>>,
     /// Live channel config — updated on every hot-reload so list_channels() reflects reality.
     pub channels_config: tokio::sync::RwLock<openfang_types::config::ChannelsConfig>,
-    /// 运行期密钥状态，作为渠道配置热更新时的单一真相来源。
+    /// Runtime secret state used as the source of truth during channel hot-reload.
     pub secrets_state: tokio::sync::RwLock<HashMap<String, String>>,
     /// Notify handle to trigger graceful HTTP server shutdown from the API.
     pub shutdown_notify: Arc<tokio::sync::Notify>,
