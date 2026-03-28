@@ -268,7 +268,8 @@ mod tests {
 
     #[test]
     fn test_load_config_defaults() {
-        let config = load_config(None);
+        let dir = tempfile::tempdir().unwrap();
+        let config = load_config(Some(&dir.path().join("config.toml")));
         assert_eq!(config.log_level, "info");
     }
 

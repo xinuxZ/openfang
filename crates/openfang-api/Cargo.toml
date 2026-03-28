@@ -39,6 +39,7 @@ hex = { workspace = true }
 socket2 = { workspace = true }
 reqwest = { workspace = true }
 qrcode = "0.14"
+rustls = { version = "0.23.37", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

@@ -10,7 +10,7 @@ use axum::Router;
 use openfang_kernel::OpenFangKernel;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Instant;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
@@ -27,6 +27,20 @@ pub struct DaemonInfo {
     pub platform: String,
 }
 
+/// Ensure rustls installs a deterministic process-wide crypto backend.
+///
+/// Rebase onto `main` can pull both `aws-lc-rs` and `ring` features into the
+/// dependency graph via reqwest / websocket clients. rustls 0.23 then refuses
+/// to auto-select a provider and panics on first TLS use. We install `ring`
+/// once at daemon boot before any HTTPS or WSS client is created.
+fn ensure_rustls_crypto_provider() {
+    static INIT: Once = Once::new();
+
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// Build the full API router with all routes, middleware, and state.
 ///
 /// This is extracted from `run_daemon()` so that embedders (e.g. openfang-desktop)
@@ -38,6 +52,8 @@ pub async fn build_router(
     kernel: Arc<OpenFangKernel>,
     listen_addr: SocketAddr,
 ) -> (Router<()>, Arc<AppState>) {
+    ensure_rustls_crypto_provider();
+
     let channels_config = kernel.config.channels.clone();
     let runtime_secrets = channel_bridge::load_runtime_secrets(&kernel.config.home_dir);
     let state = Arc::new(AppState {

@@ -1728,8 +1728,8 @@ pub async fn start_channel_bridge_with_config(
 
     // MQTT
     if let Some(ref mq_config) = config.mqtt {
-        let username = read_token(&mq_config.username_env, "MQTT (username)");
-        let password = read_token(&mq_config.password_env, "MQTT (password)");
+        let username = read_token(secrets, &mq_config.username_env, "MQTT (username)");
+        let password = read_token(secrets, &mq_config.password_env, "MQTT (password)");
         let adapter = Arc::new(MqttAdapter::new(
             mq_config.broker_url.clone(),
             mq_config.client_id.clone(),
